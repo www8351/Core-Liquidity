@@ -1,0 +1,11 @@
+services:
+  xauusd-bot:
+    build: .
+    container_name: xauusd-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Jerusalem
+    volumes:
+      - ./Research:/app/Research:ro
