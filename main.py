@@ -10,8 +10,13 @@ from telegram import Bot
 from telegram.constants import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import anthropic
-from logic import get_gold_data, calculate_quarterly_levels, get_gold_candles
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from logic import get_gold_data, calculate_quarterly_levels, get_gold_candles, get_account_balance
 from chart_generator import generate_gold_chart
+from strategy import evaluate_setup
+from orchestration import in_session, CycleGuard, format_signal_message
+from execution import place_order, is_live_trading
 
 # טעינה מפורשת של ה-ENV
 load_dotenv()
@@ -50,6 +55,37 @@ if not ANTHROPIC_KEY:
     sys.exit(1)
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+# ── Quarterly-Theory strategy config ──────────────────────────────────
+NY_TZ = ZoneInfo("America/New_York")
+RISK_PCT = float(os.getenv("RISK_PCT", "0.01"))      # fraction of balance risked per trade
+SL_BUFFER = float(os.getenv("SL_BUFFER", "0.5"))     # extra distance beyond Judas range
+STRATEGY_POLL_MIN = int(os.getenv("STRATEGY_POLL_MIN", "5"))  # poll cadence (minutes)
+
+_cycle_guard = CycleGuard()
+_levels_cache = {"date": None, "levels": None}
+
+
+def _get_daily_levels(now):
+    """Quarterly levels, cached per calendar day (daily/weekly/monthly opens are
+    fixed for the day) to avoid hammering the data feed every poll."""
+    d = now.date().isoformat()
+    if _levels_cache["date"] != d or _levels_cache["levels"] is None:
+        _levels_cache["levels"] = calculate_quarterly_levels(get_gold_data())
+        _levels_cache["date"] = d
+    return _levels_cache["levels"]
+
+
+def _make_broker():
+    """Lazily build an MT5 broker only when live trading is on (Windows only)."""
+    if not is_live_trading():
+        return None
+    try:
+        from execution import MT5Broker
+        return MT5Broker(symbol=os.getenv("MT5_SYMBOL", "XAUUSD"))
+    except Exception as e:
+        logger.error("Could not build MT5 broker — staying dry-run: %s", e)
+        return None
 
 def encode_image(image_path):
     """הופך תמונה לפורמט שה-AI יכול לקרוא"""
@@ -326,6 +362,59 @@ async def run_agent():
         except Exception:
             logger.exception("Failed to notify Telegram about main engine error")
 
+async def run_strategy_cycle():
+    """Intraday Quarterly-Theory execution — polled every few minutes.
+
+    Gated by trading session; only acts once per 90-min cycle; trades only when
+    evaluate_setup returns a LONG/SHORT in the Q3 window. Order placement is
+    routed through execution.place_order, which is dry-run unless LIVE_TRADING.
+    """
+    now = datetime.now(NY_TZ)
+    if not in_session(now):
+        logger.debug("Out of session (%s NY) — strategy idle", now.strftime("%a %H:%M"))
+        return
+
+    bot = Bot(token=TELEGRAM_TOKEN)
+    try:
+        df_5m = get_gold_candles(timeframe="5m", num_candles=250)
+        levels = dict(_get_daily_levels(now))
+        levels["Current"] = float(df_5m["Close"].iloc[-1])  # refresh live price
+
+        balance = get_account_balance()
+        signal = evaluate_setup(
+            df_5m, levels, now=now, balance=balance,
+            risk_pct=RISK_PCT, buffer=SL_BUFFER,
+        )
+
+        if signal["direction"] == "none":
+            logger.info("No setup: %s", signal["reason"])
+            return  # stay quiet on non-signals to avoid Telegram spam
+
+        # one action per 90-min cycle
+        cycle_key = {"date": now.date().isoformat(),
+                     "cycle_index": signal["meta"].get("cycle_index", -1)}
+        if not _cycle_guard.should_act(cycle_key):
+            logger.info("Cycle %s already acted — skipping", cycle_key)
+            return
+
+        broker = _make_broker()
+        result = place_order(signal, broker=broker, symbol=os.getenv("MT5_SYMBOL", "XAUUSD"))
+        logger.info("Execution result: %s", result["status"])
+
+        msg = format_signal_message(signal, levels)
+        msg += f"\n\n📦 <b>Order:</b> {result['status']}"
+        await bot.send_message(
+            chat_id=CHAT_ID, text=msg,
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.exception("Strategy cycle error")
+        try:
+            await bot.send_message(chat_id=CHAT_ID, text=f"❌ Strategy cycle error: {e}")
+        except Exception:
+            logger.exception("Failed to notify Telegram about strategy cycle error")
+
+
 async def main():
     """אורקסטרציה: ריצה מיידית ראשונה + שדיוילר יומי 08:00 Asia/Jerusalem"""
     tz = pytz.timezone("Asia/Jerusalem")
@@ -348,8 +437,19 @@ async def main():
         coalesce=True,
         max_instances=1,
     )
+    scheduler.add_job(
+        run_strategy_cycle,
+        trigger="interval",
+        minutes=STRATEGY_POLL_MIN,
+        id="quarterly_theory_strategy",
+        misfire_grace_time=60,
+        coalesce=True,
+        max_instances=1,
+    )
     scheduler.start()
-    logger.info("📅 Scheduler started — next run: daily 08:00 Asia/Jerusalem")
+    mode = "LIVE" if is_live_trading() else "DRY-RUN"
+    logger.info("📅 Scheduler started — daily AI report 08:00 + QT strategy every %dmin [%s]",
+                STRATEGY_POLL_MIN, mode)
 
     try:
         await asyncio.Event().wait()
