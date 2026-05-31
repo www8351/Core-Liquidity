@@ -348,6 +348,33 @@ def get_gold_candles(timeframe: str = "5m", num_candles: int = 150) -> pd.DataFr
     )
 
 
+def get_account_balance(default: float = 10000.0) -> float:
+    """Account balance for position sizing.
+
+    Prefers the live MT5 account balance; falls back to the ACCOUNT_BALANCE env
+    var, then to `default`. Never raises — sizing must always get a number.
+    """
+    if MT5_AVAILABLE and _init_mt5():
+        try:
+            info = mt5.account_info()
+            if info is not None:
+                return float(info.balance)
+        except Exception as e:
+            logger.warning("mt5.account_info failed: %s", e)
+        finally:
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+    env = os.getenv("ACCOUNT_BALANCE")
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            logger.warning("ACCOUNT_BALANCE not a number: %r", env)
+    return default
+
+
 def get_gold_data():
     """
     Orchestrator — fetches the two timeframes downstream consumers need:
