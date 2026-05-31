@@ -10,7 +10,7 @@ from telegram import Bot
 from telegram.constants import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import anthropic
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from logic import get_gold_data, calculate_quarterly_levels, get_gold_candles, get_account_balance
 from chart_generator import generate_gold_chart
@@ -18,6 +18,11 @@ from strategy import evaluate_setup
 from orchestration import in_session, CycleGuard, format_signal_message
 from execution import place_order, is_live_trading
 from research import load_research_notes
+from quarters import quarter_info
+from bias import htf_bias
+from volume_profile import volume_profile
+from appstate import STATE
+from webserver import start_dashboard
 
 # טעינה מפורשת של ה-ENV
 load_dotenv()
@@ -62,6 +67,11 @@ NY_TZ = ZoneInfo("America/New_York")
 RISK_PCT = float(os.getenv("RISK_PCT", "0.01"))      # fraction of balance risked per trade
 SL_BUFFER = float(os.getenv("SL_BUFFER", "0.5"))     # extra distance beyond Judas range
 STRATEGY_POLL_MIN = int(os.getenv("STRATEGY_POLL_MIN", "5"))  # poll cadence (minutes)
+
+# ── Dashboard config ──────────────────────────────────────────────────
+DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8080"))
+DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")  # required to enable the dashboard
 
 _cycle_guard = CycleGuard()
 _levels_cache = {"date": None, "levels": None}
@@ -361,6 +371,7 @@ async def run_agent():
                 await _send_plain_fallback(final_msg)
 
         logger.info("✅ Done! Message sent.")
+        STATE.record_event("daily AI report sent", ts=datetime.now(NY_TZ).strftime("%H:%M:%S"))
 
     except Exception as e:
         logger.exception("❌ Main Engine Error")
@@ -377,8 +388,15 @@ async def run_strategy_cycle():
     routed through execution.place_order, which is dry-run unless LIVE_TRADING.
     """
     now = datetime.now(NY_TZ)
-    if not in_session(now):
+    ts = now.strftime("%H:%M:%S")
+    qi = quarter_info(now)
+    session = in_session(now)
+    next_poll = (now + timedelta(minutes=STRATEGY_POLL_MIN)).strftime("%H:%M")
+
+    if not session:
         logger.debug("Out of session (%s NY) — strategy idle", now.strftime("%a %H:%M"))
+        STATE.update_market(quarter=qi["micro_quarter"], in_session=False,
+                            next_poll=next_poll)
         return
 
     bot = Bot(token=TELEGRAM_TOKEN)
@@ -387,14 +405,26 @@ async def run_strategy_cycle():
         levels = dict(_get_daily_levels(now))
         levels["Current"] = float(df_5m["Close"].iloc[-1])  # refresh live price
 
+        try:
+            vp = volume_profile(df_5m)
+        except ValueError:
+            vp = {}  # feed without real volume (e.g. TwelveData XAU/USD)
+
+        STATE.update_market(
+            price=levels["Current"], quarter=qi["micro_quarter"], in_session=True,
+            next_poll=next_poll, levels=levels, bias=htf_bias(levels), volume_profile=vp,
+        )
+
         balance = get_account_balance()
         signal = evaluate_setup(
             df_5m, levels, now=now, balance=balance,
             risk_pct=RISK_PCT, buffer=SL_BUFFER,
         )
+        STATE.update_signal(signal)
 
         if signal["direction"] == "none":
             logger.info("No setup: %s", signal["reason"])
+            STATE.record_event(f"{qi['micro_quarter']}: no trade — {signal['reason']}", ts=ts)
             return  # stay quiet on non-signals to avoid Telegram spam
 
         # one action per 90-min cycle
@@ -407,6 +437,9 @@ async def run_strategy_cycle():
         broker = _make_broker()
         result = place_order(signal, broker=broker, symbol=os.getenv("MT5_SYMBOL", "XAUUSD"))
         logger.info("Execution result: %s", result["status"])
+        STATE.record_event(
+            f"{qi['micro_quarter']}: {signal['direction'].upper()} @ {signal['entry']:.2f} "
+            f"(R:R 1:{signal['rr']:.1f}) — order {result['status']}", ts=ts)
 
         msg = format_signal_message(signal, levels)
         msg += f"\n\n📦 <b>Order:</b> {result['status']}"
@@ -427,6 +460,22 @@ async def main():
     tz = pytz.timezone("Asia/Jerusalem")
 
     logger.info("🚀 Bot starting...")
+
+    # ── Dashboard ─────────────────────────────────────────────────────
+    STATE.update_mode(is_live_trading())
+    STATE._started_at = datetime.now(NY_TZ).strftime("%Y-%m-%d %H:%M")
+    dash_runner = None
+    if DASHBOARD_TOKEN:
+        try:
+            dash_runner, _ = await start_dashboard(
+                STATE, host=DASHBOARD_HOST, port=DASHBOARD_PORT, token=DASHBOARD_TOKEN,
+            )
+            STATE.record_event("dashboard started", ts=datetime.now(NY_TZ).strftime("%H:%M:%S"))
+        except Exception:
+            logger.exception("Dashboard failed to start — continuing without it")
+    else:
+        logger.warning("DASHBOARD_TOKEN not set — dashboard disabled (set it to enable)")
+
     logger.info("⏱  Running initial agent execution (startup test)...")
     try:
         await run_agent()
@@ -464,6 +513,8 @@ async def main():
         logger.info("🛑 Shutdown signal received — stopping scheduler...")
     finally:
         scheduler.shutdown(wait=False)
+        if dash_runner is not None:
+            await dash_runner.cleanup()
         logger.info("👋 Bot stopped cleanly.")
 
 

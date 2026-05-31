@@ -7,5 +7,7 @@ services:
       - .env
     environment:
       - TZ=Asia/Jerusalem
+    ports:
+      - "8080:8080"   # dashboard (only served when DASHBOARD_TOKEN is set)
     volumes:
       - ./Research:/app/Research:ro
