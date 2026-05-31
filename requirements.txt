@@ -4,6 +4,7 @@ pytz
 requests
 python-dotenv
 python-telegram-bot
+aiohttp
 anthropic
 apscheduler
 mplfinance

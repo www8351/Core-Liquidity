@@ -12,4 +12,7 @@ COPY . .
 # הגדרת אזור זמן
 ENV TZ=Asia/Jerusalem
 
+# דשבורד ניטור (נחשף רק כאשר DASHBOARD_TOKEN מוגדר)
+EXPOSE 8080
+
 CMD ["python", "main.py"]
