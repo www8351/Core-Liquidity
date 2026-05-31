@@ -17,6 +17,7 @@ from chart_generator import generate_gold_chart
 from strategy import evaluate_setup
 from orchestration import in_session, CycleGuard, format_signal_message
 from execution import place_order, is_live_trading
+from research import load_research_notes
 
 # טעינה מפורשת של ה-ENV
 load_dotenv()
@@ -137,13 +138,19 @@ def get_ai_analysis(levels, chart_path: str | None = None):
             }
         })
 
+    # טקסט אסטרטגיה כתוב מתיקיית Research (.md / .txt) — נטען כ-ground truth
+    research_notes = load_research_notes(research_path)
+
     # הגדרת הפרומפט לסוכן עם כל הרמות ההיסטוריות
     prompt_text = f"""
 You are an elite Gold (XAUUSD) Trader specialized in ICT concepts and Quarterly Theory.
-The first attached images are the trader's personal research and strategy notes — study them as ground truth.
+The attached images are the trader's personal research and strategy notes — study them as ground truth.
 The LAST attached image is the LIVE 5-minute candlestick chart of XAUUSD (TradingView-style).
 Perform visual price-action analysis on this live chart: identify recent structure, liquidity sweeps,
 order blocks / FVGs, and confirm whether the current price interacts with the key levels listed below.
+
+TRADER'S WRITTEN STRATEGY NOTES (ground truth — study before deciding):
+{research_notes if research_notes else "(none provided)"}
 
 LIVE MARKET DATA (Gold Futures GC):
 - Current Price: {format_val(levels['Current'])}
